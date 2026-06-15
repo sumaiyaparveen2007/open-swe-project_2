@@ -1,0 +1,7 @@
+inventory = {}
+
+def add_item(name, quantity):
+    inventory[name] = quantity
+
+def get_stock(name):
+    return inventory.get(name, 0)
