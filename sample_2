@@ -1,7 +1,334 @@
-inventory = {}
+"""Inventory tracker with categories, history, low-stock alerts, and CSV export."""
 
-def add_item(name, quantity):
-    inventory[name] = quantity
+import csv
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-def get_stock(name):
-    return inventory.get(name, 0)
+inventory: Dict[str, Dict[str, Any]] = {}
+transactions: List[Dict[str, Any]] = []
+
+
+class InventoryError(ValueError):
+    """Raised when inventory data is invalid."""
+
+
+class InventoryStorageError(RuntimeError):
+    """Raised when exporting inventory data fails."""
+
+
+def _normalize_name(name: Any) -> str:
+    if name is None:
+        raise InventoryError("name is required")
+
+    normalized = str(name).strip()
+    if not normalized:
+        raise InventoryError("name cannot be empty")
+    return normalized
+
+
+def _normalize_category(category: Any) -> str:
+    if category is None:
+        return "Uncategorized"
+
+    normalized = str(category).strip()
+    if not normalized:
+        raise InventoryError("category cannot be empty")
+    return normalized
+
+
+def _normalize_quantity(quantity: Any, field_name: str = "quantity", allow_zero: bool = True) -> int:
+    if isinstance(quantity, bool) or not isinstance(quantity, int):
+        raise InventoryError(f"{field_name} must be an integer")
+
+    if quantity < 0 or (not allow_zero and quantity == 0):
+        comparator = "greater than 0" if not allow_zero else "greater than or equal to 0"
+        raise InventoryError(f"{field_name} must be {comparator}")
+
+    return quantity
+
+
+def _normalize_date(value: Optional[Any]) -> date:
+    if value is None:
+        return date.today()
+
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+
+    if isinstance(value, datetime):
+        return value.date()
+
+    if isinstance(value, str):
+        try:
+            return datetime.strptime(value, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise InventoryError("date must be YYYY-MM-DD") from exc
+
+    raise InventoryError("date must be a date object or YYYY-MM-DD string")
+
+
+def _normalize_note(note: Any) -> str:
+    if note is None:
+        return ""
+    return str(note).strip()
+
+
+def _serialise_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "name": item["name"],
+        "category": item["category"],
+        "quantity": item["quantity"],
+        "reorder_level": item["reorder_level"],
+    }
+
+
+def _serialise_transaction(transaction: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "type": transaction["type"],
+        "name": transaction["name"],
+        "category": transaction["category"],
+        "quantity": transaction["quantity"],
+        "date": transaction["date"].isoformat(),
+        "note": transaction["note"],
+        "stock_after": transaction["stock_after"],
+    }
+
+
+def _upsert_item(
+    name: str,
+    quantity: int,
+    category: Optional[Any] = None,
+    reorder_level: Optional[Any] = None,
+) -> Dict[str, Any]:
+    item = inventory.get(
+        name,
+        {
+            "name": name,
+            "quantity": 0,
+            "category": "Uncategorized",
+            "reorder_level": 0,
+        },
+    )
+
+    if category is not None:
+        item["category"] = _normalize_category(category)
+
+    if reorder_level is not None:
+        item["reorder_level"] = _normalize_quantity(reorder_level, "reorder_level")
+
+    item["quantity"] = quantity
+    inventory[name] = item
+    return item
+
+
+def _record_transaction(
+    transaction_type: str,
+    name: str,
+    quantity: int,
+    category: str,
+    note: Any,
+    stock_after: int,
+    transaction_date: Optional[Any] = None,
+) -> Dict[str, Any]:
+    transaction = {
+        "type": transaction_type,
+        "name": name,
+        "quantity": quantity,
+        "category": category,
+        "date": _normalize_date(transaction_date),
+        "note": _normalize_note(note),
+        "stock_after": stock_after,
+    }
+    transactions.append(transaction)
+    return transaction
+
+
+def clear_inventory() -> None:
+    """Remove all inventory items and history."""
+    inventory.clear()
+    transactions.clear()
+
+
+def add_item(
+    name: Any,
+    quantity: Any,
+    category: Optional[Any] = None,
+    reorder_level: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Create or replace an inventory item."""
+    normalized_name = _normalize_name(name)
+    normalized_quantity = _normalize_quantity(quantity)
+    item = _upsert_item(normalized_name, normalized_quantity, category=category, reorder_level=reorder_level)
+    return _serialise_item(item)
+
+
+def record_purchase(
+    name: Any,
+    quantity: Any,
+    category: Optional[Any] = None,
+    reorder_level: Optional[Any] = None,
+    note: Any = "",
+    transaction_date: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Increase stock and record a purchase transaction."""
+    normalized_name = _normalize_name(name)
+    normalized_quantity = _normalize_quantity(quantity, allow_zero=False)
+    item = inventory.get(normalized_name)
+
+    if item is None:
+        item = _upsert_item(normalized_name, 0, category=category, reorder_level=reorder_level)
+    else:
+        if category is not None:
+            item["category"] = _normalize_category(category)
+        if reorder_level is not None:
+            item["reorder_level"] = _normalize_quantity(reorder_level, "reorder_level")
+
+    item["quantity"] += normalized_quantity
+    transaction = _record_transaction(
+        "purchase",
+        normalized_name,
+        normalized_quantity,
+        item["category"],
+        note,
+        item["quantity"],
+        transaction_date=transaction_date,
+    )
+    return {"item": _serialise_item(item), "transaction": _serialise_transaction(transaction)}
+
+
+def record_sale(
+    name: Any,
+    quantity: Any,
+    note: Any = "",
+    transaction_date: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Decrease stock and record a sale transaction."""
+    normalized_name = _normalize_name(name)
+    normalized_quantity = _normalize_quantity(quantity, allow_zero=False)
+    item = inventory.get(normalized_name)
+
+    if item is None:
+        raise InventoryError(f"item '{normalized_name}' does not exist")
+
+    if normalized_quantity > item["quantity"]:
+        raise InventoryError(f"not enough stock for '{normalized_name}'")
+
+    item["quantity"] -= normalized_quantity
+    transaction = _record_transaction(
+        "sale",
+        normalized_name,
+        normalized_quantity,
+        item["category"],
+        note,
+        item["quantity"],
+        transaction_date=transaction_date,
+    )
+    return {"item": _serialise_item(item), "transaction": _serialise_transaction(transaction)}
+
+
+def get_stock(name: Any) -> int:
+    """Return the current stock level for an item."""
+    normalized_name = _normalize_name(name)
+    item = inventory.get(normalized_name)
+    return 0 if item is None else item["quantity"]
+
+
+def get_item(name: Any) -> Dict[str, Any]:
+    """Return a single inventory item."""
+    normalized_name = _normalize_name(name)
+    item = inventory.get(normalized_name)
+    if item is None:
+        raise InventoryError(f"item '{normalized_name}' does not exist")
+    return _serialise_item(item)
+
+
+def list_inventory() -> List[Dict[str, Any]]:
+    """Return all inventory items sorted by name."""
+    return [_serialise_item(inventory[name]) for name in sorted(inventory)]
+
+
+def get_transaction_history(name: Optional[Any] = None, transaction_type: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Return transaction history filtered by item or type."""
+    normalized_name = None if name is None else _normalize_name(name)
+    normalized_type = None if transaction_type is None else str(transaction_type).strip().lower()
+
+    filtered: List[Dict[str, Any]] = []
+    for transaction in transactions:
+        if normalized_name is not None and transaction["name"] != normalized_name:
+            continue
+        if normalized_type is not None and transaction["type"] != normalized_type:
+            continue
+        filtered.append(_serialise_transaction(transaction))
+    return filtered
+
+
+def get_purchase_history(name: Optional[Any] = None) -> List[Dict[str, Any]]:
+    """Return recorded purchase transactions."""
+    return get_transaction_history(name=name, transaction_type="purchase")
+
+
+def get_sale_history(name: Optional[Any] = None) -> List[Dict[str, Any]]:
+    """Return recorded sale transactions."""
+    return get_transaction_history(name=name, transaction_type="sale")
+
+
+def low_stock_alerts(threshold: Optional[Any] = None) -> List[Dict[str, Any]]:
+    """Return items that need restocking."""
+    normalized_threshold = None if threshold is None else _normalize_quantity(threshold, "threshold")
+    alerts: List[Dict[str, Any]] = []
+
+    for item in inventory.values():
+        alert_level = item["reorder_level"] if normalized_threshold is None else normalized_threshold
+        if item["quantity"] <= alert_level:
+            alert = _serialise_item(item)
+            alert["alert_level"] = alert_level
+            alert["shortfall"] = max(0, alert_level - item["quantity"])
+            alerts.append(alert)
+
+    return sorted(alerts, key=lambda entry: (entry["quantity"], entry["name"]))
+
+
+def inventory_report() -> Dict[str, Any]:
+    """Return a structured report for the current inventory."""
+    items = list_inventory()
+    return {
+        "items": items,
+        "total_items": len(items),
+        "total_units": sum(item["quantity"] for item in items),
+        "low_stock_items": low_stock_alerts(),
+        "purchase_count": len(get_purchase_history()),
+        "sale_count": len(get_sale_history()),
+    }
+
+
+def export_inventory_report(file_path: Any) -> str:
+    """Export the current inventory report to CSV."""
+    path = Path(file_path)
+
+    try:
+        if path.parent and not path.parent.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=["name", "category", "quantity", "reorder_level", "status"],
+            )
+            writer.writeheader()
+            for item in list_inventory():
+                writer.writerow(
+                    {
+                        "name": item["name"],
+                        "category": item["category"],
+                        "quantity": item["quantity"],
+                        "reorder_level": item["reorder_level"],
+                        "status": "LOW" if item["quantity"] <= item["reorder_level"] else "OK",
+                    }
+                )
+    except OSError as exc:
+        raise InventoryStorageError(f"unable to export CSV to {path}: {exc}") from exc
+
+    return str(path)
+
+
+export_csv = export_inventory_report
